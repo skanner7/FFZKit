@@ -22,7 +22,62 @@
 extern "C" const IMAGE_DOS_HEADER __ImageBase;
 #endif // defined(_WIN32)
 
+#if defined(__MACH__) || defined(__APPLE__)
+#include <limits.h>
+#include <mach-o/dyld.h> /* _NSGetExecutablePath */
+
+int uv_exepath(char *buffer, int *size) {
+    /* realpath(exepath) may be > PATH_MAX so double it to be on the safe side. */
+    char abspath[PATH_MAX * 2 + 1];
+    char exepath[PATH_MAX + 1];
+    uint32_t exepath_size;
+    size_t abspath_size;
+
+    if (buffer == nullptr || size == nullptr || *size == 0)
+        return -EINVAL;
+
+    exepath_size = sizeof(exepath);
+    if (_NSGetExecutablePath(exepath, &exepath_size))
+        return -EIO;
+
+    if (realpath(exepath, abspath) != abspath)
+        return -errno;
+
+    abspath_size = strlen(abspath);
+    if (abspath_size == 0)
+        return -EIO;
+
+    *size -= 1;
+    if ((size_t) *size > abspath_size)
+        *size = abspath_size;
+
+    memcpy(buffer, abspath, *size);
+    buffer[*size] = '\0';
+
+    return 0;
+}
+
+#endif //defined(__MACH__) || defined(__APPLE__)
+
 using namespace std;
+
+#ifndef HAS_CXA_DEMANGLE
+// We only support some compilers that support __cxa_demangle.
+// TODO: Checks if Android NDK has fixed this issue or not.
+#if defined(__ANDROID__) && (defined(__i386__) || defined(__x86_64__))
+#define HAS_CXA_DEMANGLE 0
+#elif (__GNUC__ >= 4 || (__GNUC__ >= 3 && __GNUC_MINOR__ >= 4)) && \
+!defined(__mips__)
+#define HAS_CXA_DEMANGLE 1
+#elif defined(__clang__) && !defined(_MSC_VER)
+#define HAS_CXA_DEMANGLE 1
+#else
+#define HAS_CXA_DEMANGLE 0
+#endif
+#endif
+#if HAS_CXA_DEMANGLE
+#include <cxxabi.h>
+#endif
 
 namespace FFZKit {
 
@@ -457,23 +512,6 @@ bool setThreadAffinity(int i) {
     return false;
 }
 
-
-#ifndef HAS_CXA_DEMANGLE
-// We only support some compilers that support __cxa_demangle.
-#if defined(__ANDROID__) && (defined(__i386__) || defined(__x86_64__))
-#define HAS_CXA_DEMANGLE 0
-#elif (__GNUC__ >= 4 || (__GNUC__ >= 3 && __GNUC_MINOR__ >= 4)) && !defined(__mips__)
-#define HAS_CXA_DEMANGLE 1
-#elif defined(__clang__) && !defined(_MSC_VER)
-#define HAS_CXA_DEMANGLE 1
-#else
-#define HAS_CXA_DEMANGLE 0
-#endif
-#endif
-
-#if HAS_CXA_DEMANGLE
-#include <cxxabi.h>
-#endif
 
 // Demangle a mangled symbol name and return the demangled name.
 // If 'mangled' isn't mangled in the first place, this function

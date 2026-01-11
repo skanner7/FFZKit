@@ -40,6 +40,12 @@
 
 #endif // HAS_EPOLL
 
+#if defined(HAS_KQUEUE)
+#include <sys/event.h>
+#define KEVENT_SIZE 1024
+#define create_event() kqueue()
+#define close_event(fd) close(fd)
+#endif // HAS_KQUEUE
 
 using namespace std;
 
@@ -168,7 +174,49 @@ void EventPoller::runLoop(bool blocked, bool ref_self) {
             }
         }
 #elif defined(HAS_KQUEUE)
+        struct kevent kevents[KEVENT_SIZE];
+        while (!exit_flag_) {
+            minDelay = getMinDelay();
+            struct timespec timeout = { (long)minDelay / 1000, (long)minDelay % 1000 * 1000000 };
 
+            startSleep();
+            int ret = kevent(event_fd_, nullptr, 0, kevents, KEVENT_SIZE, minDelay == -1 ? nullptr : &timeout);
+            sleepWakeUp();
+            if (ret <= 0) {
+                continue;
+            }
+
+            event_cache_expired_.clear();
+
+            for (int i = 0; i < ret; ++i) {
+                auto &kev = kevents[i];
+                auto fd = kev.ident;
+                if (event_cache_expired_.count(fd)) {
+                    // event cache refresh
+                    continue;
+                }
+
+                auto it = event_map_.find(fd);
+                if (it == event_map_.end()) {
+                    EV_SET(&kev, fd, kev.filter, EV_DELETE, 0, 0, nullptr);
+                    kevent(event_fd_, &kev, 1, nullptr, 0, nullptr);
+                    continue;
+                }
+                auto cb = it->second;
+                int event = 0;
+                switch (kev.filter) {
+                    case EVFILT_READ: event = Event_Read; break;
+                    case EVFILT_WRITE: event = Event_Write; break;
+                    default: WarnL << "unknown kevent filter: " << kev.filter; break;
+                }
+
+                try {
+                    (*cb)(event);
+                } catch (std::exception &ex) {
+                    ErrorL << "Exception occurred when do event task: " << ex.what();
+                }
+            }
+        }
 #else 
         int ret, max_fd;
         FdSet set_read, set_write, set_err;
@@ -304,6 +352,21 @@ int EventPoller::addEvent(int fd, int event, PollEventCB cb) {
         }
         fd_count_ = event_map_.size();
         return ret;
+#elif defined(HAS_KQUEUE)
+        struct kevent kev[2];
+        int index = 0;
+        if (event & Event_Read) {
+            EV_SET(&kev[index++], fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+        }
+        if (event & Event_Write) {
+            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+        }
+        int ret = kevent(event_fd_, kev, index, nullptr, 0, nullptr);
+        if (ret != -1) {
+            event_map_.emplace(fd, std::make_shared<PollEventCB>(std::move(cb)));
+        }
+        fd_count_ = event_map_.size();
+        return ret;        
 #else
 #ifndef _WIN32
         // win32平台，socket套接字不等于文件描述符，所以可能不适用这个限制
@@ -347,7 +410,18 @@ int EventPoller::delEvent(int fd, PollCompleteCB cb) {
         return ret;
 
 #elif defined(HAS_KQUEUE)
-
+        int ret = -1;
+        if (event_map_.erase(fd)) {
+            event_cache_expired_.emplace(fd);
+            struct kevent kev[2];
+            int index = 0;
+            EV_SET(&kev[index++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+            EV_SET(&kev[index++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+            ret = kevent(event_fd_, kev, index, nullptr, 0, nullptr);
+        }
+        cb(ret != -1);
+        fd_count_ = event_map_.size();
+        return ret;
 #else 
         int ret = -1;
         if (event_map_.erase(fd)) {
@@ -382,7 +456,13 @@ int EventPoller::modifyEvent(int fd, int event, PollCompleteCB cb) {
         cb(ret != -1);
         return ret;
 #elif defined(HAS_KQUEUE)
-
+        struct kevent kev[2];
+        int index = 0;
+        EV_SET(&kev[index++], fd, EVFILT_READ, event & Event_Read ? EV_ADD | EV_CLEAR : EV_DELETE, 0, 0, nullptr);
+        EV_SET(&kev[index++], fd, EVFILT_WRITE, event & Event_Write ? EV_ADD | EV_CLEAR : EV_DELETE, 0, 0, nullptr);
+        int ret = kevent(event_fd_, kev, index, nullptr, 0, nullptr);
+        cb(ret != -1);
+        return ret;
 #else 
         auto it = event_map_.find(fd);
         if (it != event_map_.end()) {

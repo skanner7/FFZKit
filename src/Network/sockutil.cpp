@@ -12,6 +12,11 @@
 #include "Util/uv_errno.h"
 #include "Util/onceToken.h"
 
+#if defined(__APPLE__)
+#include <ifaddrs.h>
+#include <netinet/tcp.h>
+#endif // defined(__APPLE__)
+
 using namespace std;
 
 namespace FFZKit {
@@ -594,8 +599,31 @@ uint16_t SockUtil::get_peer_port(int fd) {
     return get_socket_port(fd, getpeername);
 }
 
-#if defined(_WIN32)
 
+#if defined(__APPLE__)
+template <typename FUN>
+void for_each_netAdapter_apple(FUN &&fun) {
+    struct ifaddrs *ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) == -1) {
+        WarnL << "getifaddrs failed: " << get_uv_errmsg(true);
+        return;
+    }
+
+    struct ifaddrs *ifa = ifaddr;
+    while (ifa) {
+        if(ifa->ifa_addr->sa_family == AF_INET) {
+            if (fun(ifa)) {
+                break;
+            }
+        }
+        ifa = ifa->ifa_next;
+    }
+    freeifaddrs(ifaddr);
+}   
+#endif // defined(_APPLE__)
+
+
+#if defined(_WIN32)
 template <typename FUN>
 void for_each_netAdapter_win32(FUN &&fun) {
     ULONG nSize = 0;
@@ -686,7 +714,17 @@ bool check_ip(string &address, const string &ip) {
 }
 
 string SockUtil::get_local_ip() {
-#if defined(_WIN32)
+#if defined(__APPLE__)
+    string address = "127.0.0.1";
+    for_each_netAdapter_apple([&](struct ifaddrs *adapter) {
+        string ip = SockUtil::inet_ntoa(adapter->ifa_addr);
+        if (strstr(adapter->ifa_name, "docker")) {
+            return false;
+        }
+        return check_ip(address,ip); 
+    });
+    return address;
+#elif defined(_WIN32)
     string address = "127.0.0.1";
     for_each_netAdapter_win32([&](PIP_ADAPTER_INFO adapter) {
         IP_ADDR_STRING *ipAddr = &(adapter->IpAddressList);
@@ -718,8 +756,15 @@ string SockUtil::get_local_ip() {
 
 vector<map<string, string>> SockUtil::getInterfaceList() {
     vector<map<string, string>> ret;
-
-#if defined(_WIN32)
+#if defined(__APPLE__)
+    for_each_netAdapter_apple([&](struct ifaddrs *adapter) {
+        map<string, string> obj;
+        obj["ip"] = SockUtil::inet_ntoa(adapter->ifa_addr);
+        obj["name"] = adapter->ifa_name;
+        ret.emplace_back(std::move(obj));
+        return false;
+    });
+#elif defined(_WIN32)
     for_each_netAdapter_win32([&](PIP_ADAPTER_INFO adapter) {
         IP_ADDR_STRING *ipAddr = &(adapter->IpAddressList);
         while (ipAddr) {
@@ -783,7 +828,17 @@ int SockUtil::dissolveUdpSock(int fd) {
 }
 
 string SockUtil::get_ifr_ip(const char *if_name) {
-#if defined(_WIN32)
+#if defined(__APPLE__)
+    string ret;
+    for_each_netAdapter_apple([&](struct ifaddrs *adapter) {
+        if (strcmp(adapter->ifa_name, if_name) == 0) {
+            ret = SockUtil::inet_ntoa(adapter->ifa_addr);
+            return true;
+        }
+        return false;
+    });
+    return ret;    
+#elif defined(_WIN32)
     string ret;
     for_each_netAdapter_win32([&](PIP_ADAPTER_INFO adapter) {
         IP_ADDR_STRING *ipAddr = &(adapter->IpAddressList);
@@ -812,7 +867,18 @@ string SockUtil::get_ifr_ip(const char *if_name) {
 }
 
 string SockUtil::get_ifr_name(const char *local_ip) {
-#if defined(_WIN32)
+#if defined(__APPLE__)
+    string ret = "en0";
+    for_each_netAdapter_apple([&](struct ifaddrs *adapter) {
+        string ip = SockUtil::inet_ntoa(adapter->ifa_addr);
+        if (ip == local_ip) {
+            ret = adapter->ifa_name;
+            return true;
+        }
+        return false;
+    });
+    return ret;
+#elif defined(_WIN32)
     string ret = "en0";
     for_each_netAdapter_win32([&](PIP_ADAPTER_INFO adapter) {
         IP_ADDR_STRING *ipAddr = &(adapter->IpAddressList);
